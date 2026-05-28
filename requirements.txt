@@ -1,4 +1,4 @@
-flask
-twilio
-requests
-python-telegram-bot
+flask==2.3.3
+twilio==8.10.0
+python-telegram-bot==20.7
+requests==2.31.0
